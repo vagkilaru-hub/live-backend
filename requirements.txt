@@ -1,9 +1,6 @@
-@"
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 websockets==12.0
-python-multipart==0.0.6
-pydantic==2.5.0
 python-dotenv==1.0.0
-pytz==2024.1
-"@ | Out-File -FilePath requirements.txt -Encoding utf8
+pydantic==2.5.0
+anthropic==0.7.1
