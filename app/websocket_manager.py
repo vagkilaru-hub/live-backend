@@ -16,8 +16,9 @@ class ConnectionManager:
         self.teacher_rooms: Dict[WebSocket, str] = {}
         self.teacher_names: Dict[WebSocket, str] = {}
 
-        # Room ID storage (PERMANENT until teacher leaves)
+        # Room ID storage - FIXED: Use set to track used IDs
         self.room_ids: Dict[str, str] = {}
+        self.used_room_codes = set()  # Track all generated codes
 
         # Thread safety
         self.lock = asyncio.Lock()
@@ -27,15 +28,23 @@ class ConnectionManager:
     def generate_room_id(self) -> str:
         """
         Generate unique 6-character room code
-        PERMANENT - stays same for entire session
+        FIXED: Actually check against used codes
         """
         characters = string.ascii_uppercase + string.digits
-        while True:
+        max_attempts = 100
+        attempts = 0
+        
+        while attempts < max_attempts:
             room_id = ''.join(secrets.choice(characters) for _ in range(6))
-            # Check BOTH active rooms AND stored room IDs to ensure uniqueness
-            if room_id not in self.rooms_teachers and room_id not in self.room_ids:
+            # Check if code is truly unique
+            if room_id not in self.used_room_codes and room_id not in self.rooms_teachers:
+                self.used_room_codes.add(room_id)
                 print(f"🎲 Generated NEW unique room ID: {room_id}")
                 return room_id
+            attempts += 1
+        
+        # Fallback if somehow we can't generate unique code
+        raise Exception("Unable to generate unique room code")
 
     async def connect_teacher(self, websocket: WebSocket, teacher_name: str = "Teacher") -> str:
         """
@@ -45,32 +54,22 @@ class ConnectionManager:
         await websocket.accept()
 
         async with self.lock:
-            # Check if this teacher already has a room
-            existing_room_id = self.teacher_rooms.get(websocket)
+            # Generate new room for this teacher
+            room_id = self.generate_room_id()
             
-            if existing_room_id:
-                # Teacher reconnecting to existing room
-                room_id = existing_room_id
-                print(f"🔄 Teacher '{teacher_name}' reconnecting to existing room {room_id}")
-            else:
-                # Generate new room for this teacher
-                room_id = self.generate_room_id()
-                
-                # Initialize room structures if first teacher
-                if room_id not in self.rooms_teachers:
-                    self.rooms_teachers[room_id] = []
-                    self.rooms_students[room_id] = {}
-                    self.rooms_students_info[room_id] = {}
-                    self.room_ids[room_id] = room_id
-                    print(f"🏫 Created NEW room {room_id}")
-                
-                # Add teacher to room
-                self.rooms_teachers[room_id].append(websocket)
-                self.teacher_rooms[websocket] = room_id
-                self.teacher_names[websocket] = teacher_name
-                
-                print(f"✅ Teacher '{teacher_name}' connected to room {room_id}")
-                print(f"👨‍🏫 Room {room_id} now has {len(self.rooms_teachers[room_id])} teacher(s)")
+            # Initialize room structures
+            self.rooms_teachers[room_id] = [websocket]
+            self.rooms_students[room_id] = {}
+            self.rooms_students_info[room_id] = {}
+            self.room_ids[room_id] = room_id
+            
+            # Track teacher
+            self.teacher_rooms[websocket] = room_id
+            self.teacher_names[websocket] = teacher_name
+            
+            print(f"🏫 Created NEW room {room_id}")
+            print(f"✅ Teacher '{teacher_name}' connected to room {room_id}")
+            print(f"👨‍🏫 Room {room_id} now has {len(self.rooms_teachers[room_id])} teacher(s)")
 
         # Send confirmation to teacher
         await websocket.send_json({
@@ -132,15 +131,18 @@ class ConnectionManager:
             }
         }, exclude_id=student_id)
 
-        # Notify teachers about new student
+        # CRITICAL FIX: Notify teachers about new student with full student list
+        students_list = list(self.rooms_students_info[room_id].values())
         await self.broadcast_to_room_teachers(room_id, {
             "type": "student_join",
             "data": {
                 "student_id": student_id,
                 "student_name": student_name,
+                "students": students_list,  # Send full list
                 "timestamp": datetime.now().isoformat()
             }
         })
+        print(f"📤 Sent student_join notification to teachers with {len(students_list)} students")
 
         return True
 
@@ -171,12 +173,14 @@ class ConnectionManager:
             }
         })
 
-        # Notify teachers
+        # Notify teachers with updated student list
+        students_list = list(self.rooms_students_info.get(room_id, {}).values())
         await self.broadcast_to_room_teachers(room_id, {
             "type": "student_leave",
             "data": {
                 "student_id": student_id,
                 "student_name": student_name,
+                "students": students_list,  # Send updated list
                 "timestamp": datetime.now().isoformat()
             }
         })
@@ -185,14 +189,12 @@ class ConnectionManager:
         """
         Disconnect a teacher
         ONLY close room when LAST teacher leaves
-        Room code stays stable until all teachers disconnect
         """
         async with self.lock:
             room_id = self.teacher_rooms.get(websocket)
 
             if not room_id:
                 print("⚠️ Teacher disconnect called but no room_id found")
-                # Still clean up mappings
                 if websocket in self.teacher_rooms:
                     del self.teacher_rooms[websocket]
                 if websocket in self.teacher_names:
@@ -227,26 +229,18 @@ class ConnectionManager:
                     # Clean up ALL room data
                     if room_id in self.rooms_teachers:
                         del self.rooms_teachers[room_id]
-                        print(f"🧹 Cleaned up rooms_teachers[{room_id}]")
-
                     if room_id in self.rooms_students:
                         del self.rooms_students[room_id]
-                        print(f"🧹 Cleaned up rooms_students[{room_id}]")
-
                     if room_id in self.rooms_students_info:
                         del self.rooms_students_info[room_id]
-                        print(f"🧹 Cleaned up rooms_students_info[{room_id}]")
-
                     if room_id in self.room_ids:
                         del self.room_ids[room_id]
-                        print(f"🧹 Cleaned up room_ids[{room_id}]")
+                    # FIXED: Remove from used codes when room is completely closed
+                    if room_id in self.used_room_codes:
+                        self.used_room_codes.remove(room_id)
+                        print(f"♻️ Room code {room_id} released for reuse")
 
                     print(f"✅ Room {room_id} completely cleaned up")
-                else:
-                    # Room still has active teachers - KEEP EVERYTHING
-                    remaining_teachers = len(self.rooms_teachers[room_id])
-                    print(f"👨‍🏫 Room {room_id} still active with {remaining_teachers} teacher(s)")
-                    print(f"🔒 Room code {room_id} remains stable")
 
             # Clean up teacher mappings
             if websocket in self.teacher_rooms:
@@ -350,10 +344,7 @@ class ConnectionManager:
         await self.broadcast_to_room_teachers(room_id, message)
 
     def room_exists(self, room_id: str) -> bool:
-        """
-        Check if a room exists and has at least one teacher
-        Room is valid only if it has active teachers
-        """
+        """Check if a room exists and has at least one teacher"""
         exists = room_id in self.rooms_teachers and len(self.rooms_teachers[room_id]) > 0
         if exists:
             print(f"✅ Room {room_id} exists with {len(self.rooms_teachers[room_id])} teacher(s)")
