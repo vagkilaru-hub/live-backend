@@ -7,8 +7,8 @@ import asyncio
 import json
 
 # FIXED IMPORTS - Since main.py is IN the app folder
-from websocket_manager import manager
-from ai_processor import analyzer
+from app.websocket_manager import manager
+from app.ai_processor import analyzer
 
 # IST Timezone
 IST = pytz.timezone('Asia/Kolkata')
