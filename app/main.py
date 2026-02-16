@@ -6,7 +6,7 @@ import pytz
 import asyncio
 import json
 
-# FIXED IMPORTS - Since main.py is IN the app folder
+# FIXED IMPORTS
 from app.websocket_manager import manager
 from app.ai_processor import analyzer
 
@@ -19,9 +19,9 @@ def get_ist_timestamp():
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="Live Feedback System",
-    description="Real-Time Student Attention Monitoring",
-    version="2.0.0"
+    title="Live Feedback System with WebRTC Audio",
+    description="Real-Time Student Attention Monitoring + Two-Way Audio",
+    version="3.0.0"
 )
 
 # Configure CORS
@@ -31,6 +31,7 @@ app.add_middleware(
         "https://feedback-system-pigak94ps-vagdevis-projects-1b93f082.vercel.app",
         "https://feedback-system-tau-ten.vercel.app",
         "https://feedback-system-jyr19zbi9-vagdevis-projects-1b93f082.vercel.app",
+        "https://live-frontend-murex.vercel.app",
         "http://localhost:5173",
         "http://localhost:3000",
         "http://localhost:8000",
@@ -44,8 +45,8 @@ app.add_middleware(
 async def root():
     """Root endpoint"""
     return {
-        "message": "Live Feedback System API",
-        "version": "2.0.0",
+        "message": "Live Feedback System API with WebRTC",
+        "version": "3.0.0",
         "status": "running",
         "active_rooms": len(manager.rooms_teachers),
         "timestamp": get_ist_timestamp()
@@ -58,6 +59,7 @@ async def health_check():
         "status": "healthy",
         "rooms": len(manager.rooms_teachers),
         "total_students": sum(len(students) for students in manager.rooms_students.values()),
+        "features": ["attention_detection", "webrtc_audio", "chat"],
         "timestamp": get_ist_timestamp()
     }
 
@@ -77,11 +79,9 @@ async def teacher_websocket(
     room_id: str = Query(None, description="Optional: Join existing room"),
     name: str = Query("Teacher", description="Teacher name")
 ):
-    """WebSocket endpoint for teachers"""
+    """WebSocket endpoint for teachers with WebRTC audio support"""
     
-    # FIXED: Use the new connect_teacher method
     created_room_id = await manager.connect_teacher(websocket, name)
-    
     print(f"✅ Teacher '{name}' connected with room: {created_room_id}")
     
     # Get current students
@@ -116,7 +116,13 @@ async def teacher_websocket(
             data = await websocket.receive_json()
             msg_type = data.get("type")
             
-            if msg_type == "heartbeat":
+            # ==================== WEBRTC AUDIO HANDLING ====================
+            if msg_type in ["audio_ready", "audio_offer", "audio_answer", 
+                           "audio_ice_candidate", "audio_stopped", "audio_speaking"]:
+                await manager.handle_audio_message(websocket, created_room_id, data)
+            
+            # ==================== EXISTING HANDLERS ====================
+            elif msg_type == "heartbeat":
                 await websocket.send_json({"type": "heartbeat_ack"})
             
             elif msg_type == "teacher_camera_frame":
@@ -174,7 +180,7 @@ async def student_websocket(
     student_id: str,
     name: str = Query(..., description="Student name")
 ):
-    """WebSocket endpoint for students"""
+    """WebSocket endpoint for students with WebRTC audio support"""
     
     # Check if room exists
     if not manager.room_exists(room_id):
@@ -207,7 +213,7 @@ async def student_websocket(
     
     if room_id in manager.rooms_teachers and len(manager.rooms_teachers[room_id]) > 0:
         participants.append({
-            'id': 'teacher',
+            'id': f'teacher_{room_id}',
             'name': 'Teacher',
             'type': 'teacher'
         })
@@ -222,7 +228,13 @@ async def student_websocket(
             data = await websocket.receive_json()
             msg_type = data.get("type")
             
-            if msg_type == "attention_update":
+            # ==================== WEBRTC AUDIO HANDLING ====================
+            if msg_type in ["audio_ready", "audio_offer", "audio_answer", 
+                           "audio_ice_candidate", "audio_stopped", "audio_speaking"]:
+                await manager.handle_audio_message(websocket, room_id, data)
+            
+            # ==================== EXISTING HANDLERS ====================
+            elif msg_type == "attention_update":
                 detection_data = data.get("data", {})
                 status = detection_data.get('status', 'attentive')
                 
@@ -302,4 +314,7 @@ async def student_websocket(
 if __name__ == "__main__":
     import os
     port = int(os.getenv("PORT", 8000))
+    print("=" * 60)
+    print("🚀 Starting Live Feedback System with WebRTC Audio")
+    print("=" * 60)
     uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=True)
