@@ -1,438 +1,214 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
-from datetime import datetime
-import pytz
-import asyncio
-import json
+from fastapi import WebSocket
+from typing import Dict, List
 import logging
+from datetime import datetime
+import random
+import string
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# FIXED IMPORTS
-
-from app.ai_processor import analyzer
-
-# IST Timezone
-IST = pytz.timezone('Asia/Kolkata')
-
-def get_ist_timestamp():
-    """Get current timestamp in IST"""
-    return datetime.now(IST).isoformat()
-
-# Initialize FastAPI app
-app = FastAPI(
-    title="Live Feedback System with WebRTC Audio",
-    description="Real-Time Student Attention Monitoring + Two-Way Audio",
-    version="3.0.0"
-)
-
-# Configure CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://feedback-system-pigak94ps-vagdevis-projects-1b93f082.vercel.app",
-        "https://feedback-system-tau-ten.vercel.app",
-        "https://feedback-system-jyr19zbi9-vagdevis-projects-1b93f082.vercel.app",
-        "https://live-frontend-murex.vercel.app",
-        "https://live-frontend-e67kvaqj5-vags-projects-60577dab.vercel.app",
-        "http://localhost:5173",
-        "http://localhost:3000",
-        "http://localhost:8000",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-@app.get("/")
-async def root():
-    """Root endpoint"""
-    return {
-        "message": "Live Feedback System API with WebRTC",
-        "version": "3.0.0",
-        "status": "running",
-        "active_rooms": len(manager.rooms_teachers),
-        "timestamp": get_ist_timestamp()
-    }
-
-@app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "rooms": len(manager.rooms_teachers),
-        "total_students": sum(len(students) for students in manager.rooms_students.values()),
-        "features": ["attention_detection", "webrtc_audio", "chat"],
-        "timestamp": get_ist_timestamp()
-    }
-
-@app.get("/room/{room_id}/exists")
-async def check_room(room_id: str):
-    """Check if room exists"""
-    exists = manager.room_exists(room_id)
-    return {
-        "exists": exists,
-        "room_id": room_id,
-        "timestamp": get_ist_timestamp()
-    }
-
-@app.websocket("/ws/teacher")
-async def teacher_websocket(
-    websocket: WebSocket,
-    room_id: str = Query(None, description="Optional: Join existing room"),
-    name: str = Query("Teacher", description="Teacher name")
-):
-    """WebSocket endpoint for teachers with WebRTC audio support"""
+class ConnectionManager:
+    def __init__(self):
+        # Room management
+        self.rooms_teachers: Dict[str, List[WebSocket]] = {}
+        self.rooms_students: Dict[str, Dict[str, WebSocket]] = {}
+        self.rooms_students_info: Dict[str, Dict[str, dict]] = {}
+        
+        # Reverse lookup
+        self.teacher_to_room: Dict[WebSocket, str] = {}
+        self.student_to_room: Dict[str, str] = {}
     
-    created_room_id = await manager.connect_teacher(websocket, name)
-    logger.info(f"✅ Teacher '{name}' connected with room: {created_room_id}")
-    
-    # Get current students
-    students_list = []
-    if created_room_id in manager.rooms_students_info:
-        students_list = list(manager.rooms_students_info[created_room_id].values())
-    
-    # Send room_created message
-    await websocket.send_json({
-        "type": "room_created",
-        "data": {
-            "room_id": created_room_id,
-            "students": students_list,
-            "timestamp": get_ist_timestamp()
-        }
-    })
-    
-    # Heartbeat task
-    async def send_heartbeat():
-        try:
-            while True:
-                await asyncio.sleep(30)
-                if websocket.client_state.name == "CONNECTED":
-                    await websocket.send_json({"type": "heartbeat"})
-        except:
-            pass
-    
-    heartbeat_task = asyncio.create_task(send_heartbeat())
-    
-    try:
+    def generate_room_id(self) -> str:
+        """Generate a unique 6-character room code"""
         while True:
-            data = await websocket.receive_json()
-            msg_type = data.get("type")
-            
-            # ==================== WEBRTC AUDIO HANDLING ====================
-            
-            if msg_type == "audio_ready":
-                logger.info(f"🎤 Teacher audio ready in room {created_room_id}")
-                # Notify all students
-                await manager.broadcast_to_room_students(created_room_id, {
-                    "type": "teacher_audio_ready",
-                    "data": {
-                        "teacher_id": f"teacher_{created_room_id}",
-                        "timestamp": get_ist_timestamp()
-                    }
-                })
-            
-            elif msg_type == "webrtc_offer":
-                # Forward offer to specific peer
-                offer_data = data.get("data", {})
-                target_peer = offer_data.get("to_peer_id")
-                if target_peer:
-                    logger.info(f"📤 Forwarding offer from teacher to {target_peer}")
-                    await manager.send_to_user(target_peer, {
-                        "type": "webrtc_offer",
-                        "data": offer_data
-                    })
-            
-            elif msg_type == "webrtc_answer":
-                # Forward answer to specific peer
-                answer_data = data.get("data", {})
-                target_peer = answer_data.get("to_peer_id")
-                if target_peer:
-                    logger.info(f"📤 Forwarding answer from teacher to {target_peer}")
-                    await manager.send_to_user(target_peer, {
-                        "type": "webrtc_answer",
-                        "data": answer_data
-                    })
-            
-            elif msg_type == "webrtc_ice_candidate":
-                # Forward ICE candidate to specific peer
-                ice_data = data.get("data", {})
-                target_peer = ice_data.get("to_peer_id")
-                if target_peer:
-                    logger.info(f"📤 Forwarding ICE from teacher to {target_peer}")
-                    await manager.send_to_user(target_peer, {
-                        "type": "webrtc_ice_candidate",
-                        "data": ice_data
-                    })
-            
-            elif msg_type == "audio_stopped":
-                logger.info(f"🎤 Teacher audio stopped in room {created_room_id}")
-                await manager.broadcast_to_room_students(created_room_id, {
-                    "type": "teacher_audio_stopped",
-                    "data": {
-                        "teacher_id": f"teacher_{created_room_id}",
-                        "timestamp": get_ist_timestamp()
-                    }
-                })
-            
-            # ==================== EXISTING HANDLERS ====================
-            
-            elif msg_type == "heartbeat":
-                await websocket.send_json({"type": "heartbeat_ack"})
-            
-            elif msg_type == "teacher_camera_frame":
-                frame_data = data.get("frame")
-                if frame_data:
-                    await manager.broadcast_to_room_students(created_room_id, {
-                        "type": "teacher_frame",
-                        "data": {
-                            "frame": frame_data,
-                            "timestamp": get_ist_timestamp()
-                        }
-                    })
-            
-            elif msg_type == "request_update":
-                students_list = []
-                if created_room_id in manager.rooms_students_info:
-                    students_list = list(manager.rooms_students_info[created_room_id].values())
-                
-                await websocket.send_json({
-                    "type": "state_update",
-                    "data": {"students": students_list}
-                })
-            
-            elif msg_type == "chat_message":
-                message = data.get("message", "")
-                chat_data = {
-                    "type": "chat_message",
-                    "data": {
-                        "user_id": "teacher",
-                        "user_name": name,
-                        "user_type": "teacher",
-                        "message": message,
-                        "timestamp": get_ist_timestamp()
-                    }
-                }
-                await manager.broadcast_to_room_teachers(created_room_id, chat_data)
-                await manager.broadcast_to_room_students(created_room_id, chat_data)
-            
-            else:
-                logger.warning(f"⚠️ Unknown message type from teacher: {msg_type}")
+            room_id = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+            if room_id not in self.rooms_teachers:
+                return room_id
     
-    except WebSocketDisconnect:
-        logger.info(f"❌ Teacher disconnected from room {created_room_id}")
-        heartbeat_task.cancel()
-        await manager.disconnect_teacher(websocket)
-    except Exception as e:
-        logger.error(f"❌ Error in teacher websocket: {e}")
-        import traceback
-        traceback.print_exc()
-        heartbeat_task.cancel()
-        await manager.disconnect_teacher(websocket)
-
-
-@app.websocket("/ws/student/{room_id}/{student_id}")
-async def student_websocket(
-    websocket: WebSocket,
-    room_id: str,
-    student_id: str,
-    name: str = Query(..., description="Student name")
-):
-    """WebSocket endpoint for students with WebRTC audio support"""
-    
-    # Check if room exists
-    if not manager.room_exists(room_id):
+    async def connect_teacher(self, websocket: WebSocket, name: str) -> str:
+        """Connect teacher and create a new room"""
         await websocket.accept()
-        await websocket.send_json({
-            "type": "error",
-            "message": f"Room {room_id} does not exist. Please check the room code."
+        
+        room_id = self.generate_room_id()
+        
+        if room_id not in self.rooms_teachers:
+            self.rooms_teachers[room_id] = []
+            self.rooms_students[room_id] = {}
+            self.rooms_students_info[room_id] = {}
+        
+        self.rooms_teachers[room_id].append(websocket)
+        self.teacher_to_room[websocket] = room_id
+        
+        logger.info(f"✅ Teacher connected to room {room_id}")
+        return room_id
+    
+    async def connect_student(self, websocket: WebSocket, room_id: str, student_id: str, name: str) -> bool:
+        """Connect student to a room"""
+        if room_id not in self.rooms_teachers:
+            logger.error(f"❌ Room {room_id} does not exist")
+            return False
+        
+        await websocket.accept()
+        
+        if room_id not in self.rooms_students:
+            self.rooms_students[room_id] = {}
+            self.rooms_students_info[room_id] = {}
+        
+        self.rooms_students[room_id][student_id] = websocket
+        self.rooms_students_info[room_id][student_id] = {
+            'id': student_id,
+            'name': name,
+            'status': 'attentive',
+            'last_update': datetime.now().isoformat()
+        }
+        self.student_to_room[student_id] = room_id
+        
+        # Notify teacher
+        await self.broadcast_to_room_teachers(room_id, {
+            'type': 'student_join',
+            'data': {
+                'student_id': student_id,
+                'student_name': name,
+                'timestamp': datetime.now().isoformat()
+            }
         })
-        await websocket.close(code=4004, reason="Room not found")
-        logger.warning(f"❌ Student {name} tried to join non-existent room: {room_id}")
-        return
+        
+        logger.info(f"✅ Student {name} connected to room {room_id}")
+        return True
     
-    # Connect student
-    success = await manager.connect_student(websocket, room_id, student_id, name)
-    if not success:
-        logger.error(f"❌ Failed to connect student {name}")
-        return
+    def room_exists(self, room_id: str) -> bool:
+        """Check if room exists"""
+        return room_id in self.rooms_teachers
     
-    logger.info(f"✅ Student '{name}' joined room {room_id}")
+    async def disconnect_teacher(self, websocket: WebSocket):
+        """Disconnect teacher and close room"""
+        room_id = self.teacher_to_room.get(websocket)
+        if not room_id:
+            return
+        
+        # Notify all students
+        if room_id in self.rooms_students:
+            await self.broadcast_to_room_students(room_id, {
+                'type': 'room_closed',
+                'data': {'message': 'Teacher ended the class'}
+            })
+        
+        # Cleanup
+        if room_id in self.rooms_teachers:
+            self.rooms_teachers[room_id] = [ws for ws in self.rooms_teachers[room_id] if ws != websocket]
+            if not self.rooms_teachers[room_id]:
+                del self.rooms_teachers[room_id]
+                if room_id in self.rooms_students:
+                    del self.rooms_students[room_id]
+                if room_id in self.rooms_students_info:
+                    del self.rooms_students_info[room_id]
+        
+        if websocket in self.teacher_to_room:
+            del self.teacher_to_room[websocket]
+        
+        logger.info(f"❌ Teacher disconnected from room {room_id}")
     
-    # Send participant list
-    participants = []
-    if room_id in manager.rooms_students_info:
-        for sid, info in manager.rooms_students_info[room_id].items():
-            participants.append({
-                'id': sid,
-                'name': info['name'],
-                'type': 'student'
+    async def disconnect_student(self, room_id: str, student_id: str):
+        """Disconnect student from room"""
+        if room_id in self.rooms_students and student_id in self.rooms_students[room_id]:
+            del self.rooms_students[room_id][student_id]
+        
+        if room_id in self.rooms_students_info and student_id in self.rooms_students_info[room_id]:
+            student_name = self.rooms_students_info[room_id][student_id]['name']
+            del self.rooms_students_info[room_id][student_id]
+            
+            # Notify teacher
+            await self.broadcast_to_room_teachers(room_id, {
+                'type': 'student_leave',
+                'data': {
+                    'student_id': student_id,
+                    'student_name': student_name,
+                    'timestamp': datetime.now().isoformat()
+                }
+            })
+        
+        if student_id in self.student_to_room:
+            del self.student_to_room[student_id]
+        
+        logger.info(f"❌ Student {student_id} disconnected from room {room_id}")
+    
+    async def broadcast_to_room_teachers(self, room_id: str, message: dict):
+        """Send message to all teachers in room"""
+        if room_id not in self.rooms_teachers:
+            return
+        
+        dead_connections = []
+        for websocket in self.rooms_teachers[room_id]:
+            try:
+                await websocket.send_json(message)
+            except:
+                dead_connections.append(websocket)
+        
+        for ws in dead_connections:
+            await self.disconnect_teacher(ws)
+    
+    async def broadcast_to_room_students(self, room_id: str, message: dict):
+        """Send message to all students in room"""
+        if room_id not in self.rooms_students:
+            return
+        
+        dead_connections = []
+        for student_id, websocket in self.rooms_students[room_id].items():
+            try:
+                await websocket.send_json(message)
+            except:
+                dead_connections.append(student_id)
+        
+        for student_id in dead_connections:
+            await self.disconnect_student(room_id, student_id)
+    
+    async def send_to_student(self, room_id: str, student_id: str, message: dict):
+        """Send message to specific student"""
+        if room_id in self.rooms_students and student_id in self.rooms_students[room_id]:
+            try:
+                await self.rooms_students[room_id][student_id].send_json(message)
+            except:
+                await self.disconnect_student(room_id, student_id)
+    
+    async def broadcast_to_other_students(self, room_id: str, exclude_student_id: str, message: dict):
+        """Broadcast to all students except one"""
+        if room_id not in self.rooms_students:
+            return
+        
+        for student_id, websocket in self.rooms_students[room_id].items():
+            if student_id != exclude_student_id:
+                try:
+                    await websocket.send_json(message)
+                except:
+                    pass
+    
+    async def update_student_attention(self, room_id: str, student_id: str, status_data: dict):
+        """Update student attention status"""
+        if room_id in self.rooms_students_info and student_id in self.rooms_students_info[room_id]:
+            self.rooms_students_info[room_id][student_id].update(status_data)
+            self.rooms_students_info[room_id][student_id]['last_update'] = datetime.now().isoformat()
+            
+            # Broadcast status update to teacher
+            await self.broadcast_to_room_teachers(room_id, {
+                'type': 'attention_update',
+                'data': {
+                    'student_id': student_id,
+                    'student_name': self.rooms_students_info[room_id][student_id]['name'],
+                    'status': status_data.get('status'),
+                    'confidence': status_data.get('confidence'),
+                    'timestamp': datetime.now().isoformat()
+                }
             })
     
-    if room_id in manager.rooms_teachers and len(manager.rooms_teachers[room_id]) > 0:
-        participants.append({
-            'id': f'teacher_{room_id}',
-            'name': 'Teacher',
-            'type': 'teacher'
+    async def broadcast_camera_frame(self, room_id: str, student_id: str, frame_data: str):
+        """Broadcast student camera frame to teacher"""
+        await self.broadcast_to_room_teachers(room_id, {
+            'type': 'camera_frame',
+            'data': {
+                'student_id': student_id,
+                'frame': frame_data
+            }
         })
-    
-    await websocket.send_json({
-        "type": "participant_list",
-        "data": {"participants": participants}
-    })
-    
-    try:
-        while True:
-            data = await websocket.receive_json()
-            msg_type = data.get("type")
-            
-            # ==================== WEBRTC AUDIO HANDLING ====================
-            
-            if msg_type == "audio_ready":
-                logger.info(f"🎤 Student {name} audio ready in room {room_id}")
-                # Notify teacher
-                await manager.broadcast_to_room_teachers(room_id, {
-                    "type": "student_audio_ready",
-                    "data": {
-                        "student_id": student_id,
-                        "student_name": name,
-                        "timestamp": get_ist_timestamp()
-                    }
-                })
-            
-            elif msg_type == "webrtc_offer":
-                # Forward offer
-                offer_data = data.get("data", {})
-                target_peer = offer_data.get("to_peer_id")
-                if target_peer:
-                    logger.info(f"📤 Forwarding offer from {student_id} to {target_peer}")
-                    await manager.send_to_user(target_peer, {
-                        "type": "webrtc_offer",
-                        "data": offer_data
-                    })
-            
-            elif msg_type == "webrtc_answer":
-                # Forward answer
-                answer_data = data.get("data", {})
-                target_peer = answer_data.get("to_peer_id")
-                if target_peer:
-                    logger.info(f"📤 Forwarding answer from {student_id} to {target_peer}")
-                    await manager.send_to_user(target_peer, {
-                        "type": "webrtc_answer",
-                        "data": answer_data
-                    })
-            
-            elif msg_type == "webrtc_ice_candidate":
-                # Forward ICE candidate
-                ice_data = data.get("data", {})
-                target_peer = ice_data.get("to_peer_id")
-                if target_peer:
-                    logger.info(f"📤 Forwarding ICE from {student_id} to {target_peer}")
-                    await manager.send_to_user(target_peer, {
-                        "type": "webrtc_ice_candidate",
-                        "data": ice_data
-                    })
-            
-            elif msg_type == "audio_stopped":
-                logger.info(f"🎤 Student {name} audio stopped in room {room_id}")
-                await manager.broadcast_to_room_teachers(room_id, {
-                    "type": "student_audio_stopped",
-                    "data": {
-                        "student_id": student_id,
-                        "student_name": name,
-                        "timestamp": get_ist_timestamp()
-                    }
-                })
-            
-            # ==================== EXISTING HANDLERS ====================
-            
-            elif msg_type == "attention_update":
-                detection_data = data.get("data", {})
-                status = detection_data.get('status', 'attentive')
-                
-                logger.info("=" * 80)
-                logger.info(f"🔥 RECEIVED FROM {name}: {status.upper()}")
-                logger.info(f"   Timestamp: {get_ist_timestamp()}")
-                logger.info("=" * 80)
-                
-                # Analyze attention
-                analyzed_status, confidence, analysis = analyzer.analyze_attention(student_id, detection_data)
-                
-                # Update student status
-                await manager.update_student_attention(room_id, student_id, {
-                    "status": analyzed_status,
-                    "confidence": confidence
-                })
-                
-                # Generate alert
-                alert = analyzer.generate_alert(student_id, name, analyzed_status, analysis)
-                
-                if alert:
-                    if alert['alert_type'] == 'clear_alert':
-                        await manager.broadcast_to_room_teachers(room_id, {
-                            "type": "clear_alert",
-                            "data": {"student_id": student_id}
-                        })
-                    else:
-                        alert_message = {
-                            "type": "alert",
-                            "data": {
-                                "student_id": student_id,
-                                "student_name": name,
-                                "alert_type": alert['alert_type'],
-                                "message": alert['message'],
-                                "severity": alert['severity'],
-                                "timestamp": get_ist_timestamp()
-                            }
-                        }
-                        await manager.broadcast_to_room_teachers(room_id, alert_message)
-            
-            elif msg_type == "camera_frame":
-                frame_data = data.get("frame")
-                if frame_data:
-                    await manager.broadcast_camera_frame(room_id, student_id, frame_data)
-            
-            elif msg_type == "chat_message":
-                message = data.get("message", "")
-                chat_data = {
-                    "type": "chat_message",
-                    "data": {
-                        "user_id": student_id,
-                        "user_name": name,
-                        "user_type": "student",
-                        "message": message,
-                        "timestamp": get_ist_timestamp()
-                    }
-                }
-                await manager.broadcast_to_room_teachers(room_id, chat_data)
-                await manager.broadcast_to_room_students(room_id, chat_data)
-            
-            elif msg_type == "heartbeat":
-                await websocket.send_json({"type": "heartbeat_ack"})
-            
-            else:
-                logger.warning(f"⚠️ Unknown message type from student: {msg_type}")
-    
-    except WebSocketDisconnect:
-        logger.info(f"❌ Student '{name}' disconnected")
-        await manager.disconnect_student(room_id, student_id)
-        analyzer.reset_student_tracking(student_id)
-    except Exception as e:
-        logger.error(f"❌ Error in student websocket: {e}")
-        import traceback
-        traceback.print_exc()
-        await manager.disconnect_student(room_id, student_id)
-        analyzer.reset_student_tracking(student_id)
 
-
-# For local development
-if __name__ == "__main__":
-    import os
-    port = int(os.getenv("PORT", 8000))
-    logger.info("=" * 60)
-    logger.info("🚀 Starting Live Feedback System with WebRTC Audio")
-    logger.info("=" * 60)
-    uvicorn.run("app.main:app", host="0.0.0.0", port=port, reload=True)
+# ✅ THIS LINE IS CRITICAL - IT MUST BE AT THE END
+manager = ConnectionManager()
