@@ -37,6 +37,7 @@ app.add_middleware(
         "https://feedback-system-tau-ten.vercel.app",
         "https://feedback-system-jyr19zbi9-vagdevis-projects-1b93f082.vercel.app",
         "https://live-frontend-murex.vercel.app",
+        "https://live-frontend-e67kvaqj5-vags-projects-60577dab.vercel.app",
         "http://localhost:5173",
         "http://localhost:3000",
         "http://localhost:8000",
@@ -121,11 +122,45 @@ async def teacher_websocket(
             data = await websocket.receive_json()
             msg_type = data.get("type")
             
+            # ==================== CAMERA STREAMING ====================
+            
+            if msg_type == "teacher_camera_frame":
+                # Handle old format: {type: "teacher_camera_frame", frame: "data"}
+                frame_data = data.get("frame")
+                if frame_data:
+                    logger.info(f"📹 Broadcasting teacher camera frame ({len(frame_data)} bytes)")
+                    await manager.broadcast_to_room_students(created_room_id, {
+                        "type": "teacher_frame",
+                        "data": {
+                            "frame": frame_data,
+                            "timestamp": get_ist_timestamp()
+                        }
+                    })
+            
+            elif msg_type == "teacher_frame":
+                # Handle new format: {type: "teacher_frame", data: {frame: "data"}}
+                frame_data = data.get("data", {}).get("frame")
+                if frame_data:
+                    logger.info(f"📹 Broadcasting teacher frame ({len(frame_data)} bytes)")
+                    await manager.broadcast_to_room_students(created_room_id, {
+                        "type": "teacher_frame",
+                        "data": {
+                            "frame": frame_data,
+                            "timestamp": get_ist_timestamp()
+                        }
+                    })
+            
+            elif msg_type == "teacher_camera_stopped":
+                logger.info(f"📹 Teacher camera stopped in room {created_room_id}")
+                await manager.broadcast_to_room_students(created_room_id, {
+                    "type": "teacher_camera_stopped",
+                    "data": {}
+                })
+            
             # ==================== WEBRTC AUDIO HANDLING ====================
             
-            if msg_type == "audio_ready":
+            elif msg_type == "audio_ready":
                 logger.info(f"🎤 Teacher audio ready in room {created_room_id}")
-                # Notify all students that teacher audio is ready
                 await manager.broadcast_to_room_students(created_room_id, {
                     "type": "teacher_audio_ready",
                     "data": {
@@ -135,7 +170,6 @@ async def teacher_websocket(
                 })
             
             elif msg_type == "webrtc_offer":
-                # Forward WebRTC offer to specific peer
                 target_peer = data.get("data", {}).get("to_peer_id")
                 if target_peer:
                     logger.info(f"📤 Forwarding WebRTC offer from teacher to {target_peer}")
@@ -145,7 +179,6 @@ async def teacher_websocket(
                     })
             
             elif msg_type == "webrtc_answer":
-                # Forward WebRTC answer to specific peer
                 target_peer = data.get("data", {}).get("to_peer_id")
                 if target_peer:
                     logger.info(f"📤 Forwarding WebRTC answer from teacher to {target_peer}")
@@ -155,7 +188,6 @@ async def teacher_websocket(
                     })
             
             elif msg_type == "webrtc_ice_candidate":
-                # Forward ICE candidate to specific peer
                 target_peer = data.get("data", {}).get("to_peer_id")
                 if target_peer:
                     logger.info(f"📤 Forwarding ICE candidate from teacher to {target_peer}")
@@ -166,7 +198,6 @@ async def teacher_websocket(
             
             elif msg_type == "audio_stopped":
                 logger.info(f"🎤 Teacher audio stopped in room {created_room_id}")
-                # Notify all students that teacher audio stopped
                 await manager.broadcast_to_room_students(created_room_id, {
                     "type": "teacher_audio_stopped",
                     "data": {
@@ -175,21 +206,10 @@ async def teacher_websocket(
                     }
                 })
             
-            # ==================== EXISTING HANDLERS ====================
+            # ==================== OTHER HANDLERS ====================
             
             elif msg_type == "heartbeat":
                 await websocket.send_json({"type": "heartbeat_ack"})
-            
-            elif msg_type == "teacher_camera_frame":
-                frame_data = data.get("frame")
-                if frame_data:
-                    await manager.broadcast_to_room_students(created_room_id, {
-                        "type": "teacher_frame",
-                        "data": {
-                            "frame": frame_data,
-                            "timestamp": get_ist_timestamp()
-                        }
-                    })
             
             elif msg_type == "request_update":
                 students_list = []
@@ -217,7 +237,8 @@ async def teacher_websocket(
                 await manager.broadcast_to_room_students(created_room_id, chat_data)
             
             else:
-                logger.warning(f"⚠️ Unknown message type from teacher: {msg_type}")
+                if msg_type != "heartbeat":  # Don't log heartbeat warnings
+                    logger.warning(f"⚠️ Unknown message type from teacher: {msg_type}")
     
     except WebSocketDisconnect:
         logger.info(f"❌ Teacher disconnected from room {created_room_id}")
@@ -290,7 +311,6 @@ async def student_websocket(
             
             if msg_type == "audio_ready":
                 logger.info(f"🎤 Student {name} audio ready in room {room_id}")
-                # Notify teacher that student audio is ready
                 await manager.broadcast_to_room_teachers(room_id, {
                     "type": "student_audio_ready",
                     "data": {
@@ -299,8 +319,6 @@ async def student_websocket(
                         "timestamp": get_ist_timestamp()
                     }
                 })
-                
-                # Also notify other students
                 await manager.broadcast_to_other_students(room_id, student_id, {
                     "type": "student_audio_ready",
                     "data": {
@@ -311,12 +329,9 @@ async def student_websocket(
                 })
             
             elif msg_type == "webrtc_offer":
-                # Forward WebRTC offer to specific peer
                 target_peer = data.get("data", {}).get("to_peer_id")
                 if target_peer:
                     logger.info(f"📤 Forwarding WebRTC offer from {student_id} to {target_peer}")
-                    
-                    # Check if target is teacher or another student
                     if target_peer == "teacher":
                         await manager.broadcast_to_room_teachers(room_id, {
                             "type": "webrtc_offer",
@@ -329,12 +344,9 @@ async def student_websocket(
                         })
             
             elif msg_type == "webrtc_answer":
-                # Forward WebRTC answer to specific peer
                 target_peer = data.get("data", {}).get("to_peer_id")
                 if target_peer:
                     logger.info(f"📤 Forwarding WebRTC answer from {student_id} to {target_peer}")
-                    
-                    # Check if target is teacher or another student
                     if target_peer == "teacher":
                         await manager.broadcast_to_room_teachers(room_id, {
                             "type": "webrtc_answer",
@@ -347,12 +359,9 @@ async def student_websocket(
                         })
             
             elif msg_type == "webrtc_ice_candidate":
-                # Forward ICE candidate to specific peer
                 target_peer = data.get("data", {}).get("to_peer_id")
                 if target_peer:
                     logger.info(f"📤 Forwarding ICE candidate from {student_id} to {target_peer}")
-                    
-                    # Check if target is teacher or another student
                     if target_peer == "teacher":
                         await manager.broadcast_to_room_teachers(room_id, {
                             "type": "webrtc_ice_candidate",
@@ -366,7 +375,6 @@ async def student_websocket(
             
             elif msg_type == "audio_stopped":
                 logger.info(f"🎤 Student {name} audio stopped in room {room_id}")
-                # Notify teacher that student audio stopped
                 await manager.broadcast_to_room_teachers(room_id, {
                     "type": "student_audio_stopped",
                     "data": {
@@ -376,7 +384,7 @@ async def student_websocket(
                     }
                 })
             
-            # ==================== EXISTING HANDLERS ====================
+            # ==================== OTHER HANDLERS ====================
             
             elif msg_type == "attention_update":
                 detection_data = data.get("data", {})
@@ -387,16 +395,13 @@ async def student_websocket(
                 logger.info(f"   Timestamp: {get_ist_timestamp()}")
                 logger.info("=" * 80)
                 
-                # Analyze attention
                 analyzed_status, confidence, analysis = analyzer.analyze_attention(student_id, detection_data)
                 
-                # Update student status
                 await manager.update_student_attention(room_id, student_id, {
                     "status": analyzed_status,
                     "confidence": confidence
                 })
                 
-                # Generate alert
                 alert = analyzer.generate_alert(student_id, name, analyzed_status, analysis)
                 
                 if alert:
@@ -443,7 +448,8 @@ async def student_websocket(
                 await websocket.send_json({"type": "heartbeat_ack"})
             
             else:
-                logger.warning(f"⚠️ Unknown message type from student: {msg_type}")
+                if msg_type != "heartbeat":
+                    logger.warning(f"⚠️ Unknown message type from student: {msg_type}")
     
     except WebSocketDisconnect:
         logger.info(f"❌ Student '{name}' disconnected")
