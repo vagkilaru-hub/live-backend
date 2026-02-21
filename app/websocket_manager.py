@@ -12,7 +12,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # FIXED IMPORTS
-from app.websocket_manager import manager
+
 from app.ai_processor import analyzer
 
 # IST Timezone
